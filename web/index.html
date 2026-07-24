@@ -101,13 +101,17 @@
 
     #control-panel {
       position: absolute; bottom: 12px; left: 12px; right: 12px;
-      display: flex; flex-direction: row; flex-wrap: nowrap; gap: 10px; justify-content: center; align-items: stretch;
+      display: flex; flex-direction: row; flex-wrap: wrap; gap: 10px; justify-content: center; align-items: stretch;
       background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px;
-      padding: 10px; box-shadow: 0 12px 40px rgba(0,0,0,0.5); backdrop-filter: blur(6px); z-index: 25; overflow-x: auto;
+      padding: 10px; box-shadow: 0 12px 40px rgba(0,0,0,0.5); backdrop-filter: blur(6px); z-index: 25;
+      max-height: 42vh; overflow-y: auto;
     }
-    .panel { background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.07); border-radius: 8px; padding: 8px 10px; min-width: auto; flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+    .panel { background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.07); border-radius: 8px; padding: 8px 10px; min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+    /* Manual Sort and Camera/View hold the most buttons, so let them claim more
+       width and wrap their buttons onto multiple rows instead of overflowing. */
+    .actions-panel, .cam-panel { flex: 2 1 320px; }
     .panel h3 { margin: 0; font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; text-align: center; }
-    .panel-body { display: flex; flex-direction: row; align-items: center; gap: 8px; flex-wrap: nowrap; justify-content: center; }
+    .panel-body { display: flex; flex-direction: row; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: center; }
     .status-row { display: flex; align-items: center; gap: 8px; font-size: 11px; margin: 0; color: #c0c7d2; }
     .led { width: 8px; height: 8px; border-radius: 50%; background: #2a2d35; box-shadow: inset 0 0 2px #000; border: 1px solid rgba(255,255,255,0.1); }
     .led.green.on { background: #2ecc71; box-shadow: 0 0 6px #2ecc71; border-color: #2ecc71; }
@@ -322,6 +326,10 @@
     const INCINERATOR_POS = new THREE.Vector3(15.0, 0, -3.0);
     const ARM_BASE_POS = new THREE.Vector3(11.5, 0.5, -1.0);
     const ARM_L1 = 8.5, ARM_L2 = 8.5, SHOULDER_H = 1.0;
+    // Folded standby pose: gripper elevated and drawn back toward the base so
+    // the arm rests in a natural bent posture (not stuck straight out).
+    const ARM_REST_TARGET = new THREE.Vector3(4.5, 6.0, 0.5);
+    let armRest = { y: 0, sx: 0, ex: 0 };  // resting joint angles, set by computeRestPose()
 
     let sessionId = null;
     let currentState = null;
@@ -696,6 +704,12 @@
       heldItemMesh = new THREE.Mesh(new THREE.SphereGeometry(0.7, 24, 24), new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.35 })); heldItemMesh.position.set(0, 1.2, 0); heldItemMesh.visible = false; wristGroup.add(heldItemMesh);
       armScanner = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, 2.8, 18, 1, true), new THREE.MeshBasicMaterial({ color: COLORS.scan, transparent: true, opacity: 0.45, side: THREE.DoubleSide, blending: THREE.AdditiveBlending }));
       armScanner.position.set(0, -1.5, 0); armScanner.visible = false; wristGroup.add(armScanner);
+
+      // Start folded in the standby pose rather than stuck straight out.
+      computeRestPose();
+      armGroup.rotation.y = armRest.y;
+      shoulderGroup.rotation.x = armRest.sx;
+      elbowGroup.rotation.x = armRest.ex;
     }
 
     async function api(path, opts = {}) {
@@ -868,6 +882,17 @@
       ]);
     }
 
+    // Resolve the folded standby pose once (in joint space) so both the reset
+    // snap and the idle sway can reference the same neutral posture.
+    function computeRestPose() {
+      const sol = solveArm(ARM_REST_TARGET);
+      armRest = { y: sol.theta, sx: -sol.alpha, ex: -sol.beta };
+    }
+
+    function moveArmToRest(duration = 320) {
+      return moveArmTo(ARM_REST_TARGET, duration);
+    }
+
     function updateArmWrist() {
       if (!wristGroup) return;
       // keep gripper pointing down (local +y -> world -y) by summing total x rotation to PI
@@ -1014,12 +1039,12 @@
         await new Promise(resolve => { const start = performance.now(); function scan(time) { const t = Math.min((time - start) / 450, 1); armScanner.material.opacity = 0.5 + 0.25 * Math.sin(t * Math.PI * 8); itemMesh.children.forEach(c => { if (c.userData.isWaste) c.material.emissiveIntensity = 0.6 - 0.5 * t; }); if (t < 1) requestAnimationFrame(scan); else resolve(); } requestAnimationFrame(scan); });
         armScanner.visible = false; itemMesh.children.forEach(c => { if (c.userData.isWaste) c.material.emissive.setHex(0x000000); });
       }
-      await moveArmTo(homeTarget, 280);
+      await moveArmToRest(300);
     }
 
     async function createSession() {
       stopAuto(); animating = true; tweens = []; burstParticles = []; fallingItems = []; smokeParticles = [];
-      if (armGroup) { armGroup.rotation.y = 0; shoulderGroup.rotation.x = 0; elbowGroup.rotation.x = 0; }
+      if (armGroup) { computeRestPose(); armGroup.rotation.y = armRest.y; shoulderGroup.rotation.x = armRest.sx; elbowGroup.rotation.x = armRest.ex; }
       if (loadTimer) { clearInterval(loadTimer); loadTimer = null; }
       document.getElementById('log').innerHTML = ''; document.getElementById('badges').innerHTML = ''; earnedBadges.clear();
       document.getElementById('loading').classList.remove('hidden');
@@ -1159,6 +1184,13 @@
     function animate(time) {
       requestAnimationFrame(animate); controls.update(); updateStatus();
       for (let i = tweens.length - 1; i >= 0; i--) { tweens[i].update(time); if (!tweens[i].active) tweens.splice(i, 1); }
+      // Gentle idle "breathing" of the arm around its rest pose while at rest,
+      // so the agent looks alive but stays minimal (no big motions when idle).
+      if (!animating && armGroup) {
+        armGroup.rotation.y = armRest.y + 0.05 * Math.sin(time / 1400);
+        shoulderGroup.rotation.x = armRest.sx + 0.03 * Math.sin(time / 1100 + 0.5);
+        elbowGroup.rotation.x = armRest.ex + 0.04 * Math.sin(time / 900 + 1.2);
+      }
       updateParticles(); updateArmWrist(); updateSupervisors(time);
       if (beltTexture) beltTexture.offset.y -= 0.0015;
       if (!animating && !isSliding && itemGroup) itemGroup.position.y = ITEM_PICK_POS.y + 0.04 * Math.sin(time / 450 + 1);

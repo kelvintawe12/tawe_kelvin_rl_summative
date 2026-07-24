@@ -30,12 +30,16 @@ serve = [
     "uvicorn>=0.29.0",
 ]
 
+[project.scripts]
+waste-demo = "run:main"
+
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["environment", "training", "results"]
+py-modules = ["main", "play", "serve", "run"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

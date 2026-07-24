@@ -67,6 +67,7 @@ from gymnasium import spaces
 
 from environment.dynamics import (
     DynamicsConfig,
+    RandomizationConfig,
     RewardConfig,
     value_multiplier,
     sensor_noise_sigma,
@@ -114,7 +115,7 @@ _SORT_ACTION_TO_BIN = {
 class WasteSegregationEnv(gym.Env):
     """A custom Gymnasium environment for RL-based waste segregation.
 
-    Observation (Box(21,), float32, all components normalized to [0, 1]):
+    Observation (Box(21 + 6*queue_lookahead,), float32, normalized to [0, 1]):
         [0:4]   bin fill fractions (organic, plastic, metal, glass)
         [4:8]   bin contamination-so-far fractions (same bin order)
         [8:12]  bin jam-cooldown remaining, normalized
@@ -124,6 +125,10 @@ class WasteSegregationEnv(gym.Env):
                 glass, contaminant), approximately sums to 1
         [19]    current item mass, normalized
         [20]    steps remaining in episode, normalized
+        [21:]   (only if queue_lookahead > 0) for each of the next
+                `queue_lookahead` upcoming items: its noisy observed
+                composition (5) and normalized mass (1) -- a conveyor buffer
+                that lets the agent plan ahead instead of reacting item by item.
 
     Action (Discrete(7)): see ACTION_NAMES / module-level ACTION_* constants.
     """
@@ -141,10 +146,19 @@ class WasteSegregationEnv(gym.Env):
         category_probs: Optional[np.ndarray] = None,
         dynamics_config: Optional[DynamicsConfig] = None,
         reward_config: Optional[RewardConfig] = None,
+        queue_lookahead: int = 0,
+        domain_randomize: bool = False,
+        randomization_config: Optional[RandomizationConfig] = None,
         render_mode: Optional[str] = None,
         seed: Optional[int] = None,
     ) -> None:
         super().__init__()
+
+        assert max_steps >= 1, "max_steps must be >= 1"
+        assert bin_capacity > 0.0, "bin_capacity must be positive"
+        assert ship_out_interval >= 1, "ship_out_interval must be >= 1"
+        assert energy_budget >= 0.0, "energy_budget must be non-negative"
+        assert queue_lookahead >= 0, "queue_lookahead must be >= 0"
 
         self.max_steps = max_steps
         self.bin_capacity = bin_capacity
@@ -154,11 +168,24 @@ class WasteSegregationEnv(gym.Env):
         self.item_mass_range = item_mass_range
         self.cfg = dynamics_config if dynamics_config is not None else DynamicsConfig()
         self.rcfg = reward_config if reward_config is not None else RewardConfig()
+        self.queue_lookahead = queue_lookahead
+        self.domain_randomize = domain_randomize
+        self.rand_cfg = (
+            randomization_config if randomization_config is not None else RandomizationConfig()
+        )
         self.render_mode = render_mode
 
+        # Per-episode active dynamics parameters. With domain randomization off
+        # these stay equal to the config defaults; with it on they are
+        # resampled each reset() (see _sample_episode_regime).
+        self._active_sigma_min = self.cfg.sigma_min
+        self._active_sigma_max = self.cfg.sigma_max
+        self._active_jam_baseline = self.cfg.jam_baseline_contamination
+
         self.action_space = spaces.Discrete(N_ACTIONS)
+        obs_dim = 21 + 6 * queue_lookahead
         self.observation_space = spaces.Box(
-            low=0.0, high=1.0, shape=(21,), dtype=np.float32
+            low=0.0, high=1.0, shape=(obs_dim,), dtype=np.float32
         )
 
         # Item generation is two-stage: first a "dominant material" category
@@ -176,11 +203,14 @@ class WasteSegregationEnv(gym.Env):
         # results/generalization.py). Default is calibrated so organic
         # dominates (~30-61% of MSW by mass in African city studies).
         if category_probs is None:
-            self._category_probs = np.array([0.42, 0.20, 0.10, 0.10, 0.18])
+            self._base_category_probs = np.array([0.42, 0.20, 0.10, 0.10, 0.18])
         else:
             cp = np.asarray(category_probs, dtype=np.float64)
             assert cp.shape == (5,), "category_probs must have shape (5,)"
-            self._category_probs = cp / cp.sum()
+            self._base_category_probs = cp / cp.sum()
+        # Active demand profile for the current episode. Equal to the base
+        # profile unless domain randomization resamples it each reset().
+        self._category_probs = self._base_category_probs.copy()
         self._dominant_alpha = 5.0
         self._other_alpha = 0.8
 
@@ -200,6 +230,9 @@ class WasteSegregationEnv(gym.Env):
         self.current_item_true = np.zeros(5, dtype=np.float64)
         self.current_item_obs = np.zeros(5, dtype=np.float64)
         self.current_item_mass = 0.0
+        # Conveyor lookahead buffer: the next `queue_lookahead` items, each a
+        # dict with true/observed composition and mass. Empty when disabled.
+        self._item_queue: list[dict] = []
         self.last_action_name = ""
         self.last_reward_breakdown: dict[str, float] = {}
         self.total_reward = 0.0
@@ -231,9 +264,75 @@ class WasteSegregationEnv(gym.Env):
         self.episode_stats = {"correct_sorts": 0, "incorrect_sorts": 0,
                                "jams_triggered": 0, "shipouts": 0}
 
+        # `options={"domain_randomize": bool}` lets a caller flip randomization
+        # per-reset (e.g. randomized training resets, fixed evaluation resets)
+        # without constructing a new env.
+        randomize = self.domain_randomize
+        if options is not None and "domain_randomize" in options:
+            randomize = bool(options["domain_randomize"])
+        self._sample_episode_regime(randomize)
+
+        # Prime the conveyor: the current item plus the lookahead buffer.
+        self._item_queue = [self._generate_item() for _ in range(self.queue_lookahead)]
         self._spawn_item()
         obs = self._get_observation()
         return obs, self._get_info()
+
+    def _sample_episode_regime(self, randomize: bool) -> None:
+        """Set the episode's active dynamics parameters.
+
+        With `randomize` False, restore the fixed config defaults. With it
+        True, sample a fresh demand profile, sensor-noise scale, and jam
+        baseline from `RandomizationConfig` using the seeded RNG (so a given
+        reset seed still reproduces the same randomized episode exactly).
+        """
+        rc = self.rand_cfg
+        if not randomize:
+            self._category_probs = self._base_category_probs.copy()
+            self._active_sigma_min = self.cfg.sigma_min
+            self._active_sigma_max = self.cfg.sigma_max
+            self._active_jam_baseline = self.cfg.jam_baseline_contamination
+            return
+
+        if rc.randomize_demand:
+            alpha = self._base_category_probs * rc.demand_concentration
+            self._category_probs = self._rng.dirichlet(alpha)
+        else:
+            self._category_probs = self._base_category_probs.copy()
+
+        if rc.randomize_sensor:
+            scale = self._rng.uniform(*rc.sensor_sigma_scale_range)
+            self._active_sigma_min = self.cfg.sigma_min * scale
+            self._active_sigma_max = self.cfg.sigma_max * scale
+        else:
+            self._active_sigma_min = self.cfg.sigma_min
+            self._active_sigma_max = self.cfg.sigma_max
+
+        if rc.randomize_jam:
+            self._active_jam_baseline = float(self._rng.uniform(*rc.jam_baseline_range))
+        else:
+            self._active_jam_baseline = self.cfg.jam_baseline_contamination
+
+    def action_masks(self) -> np.ndarray:
+        """Boolean validity mask over the action space (shape ``(7,)``).
+
+        A jammed bin physically cannot accept material this step, so its
+        corresponding ``sort_*`` action is masked out (invalid). The
+        non-committal / diversion actions (``reject``, ``hold``,
+        ``scan_closely``) are always valid, so the mask is never all-False and
+        the agent always has a legal move.
+
+        This is the method name expected by ``sb3_contrib.MaskablePPO`` and by
+        the ``ActionMasker`` wrapper, so the environment can be dropped into a
+        maskable-policy training loop unchanged. The same array is also
+        surfaced in ``info["action_mask"]`` and ``to_json()`` so a
+        rule-based/greedy controller or a web frontend can consume it too.
+        """
+        mask = np.ones(N_ACTIONS, dtype=bool)
+        for action, bin_name in _SORT_ACTION_TO_BIN.items():
+            if self.bin_jam_cooldown[BINS.index(bin_name)] > 0:
+                mask[action] = False
+        return mask
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
         assert self.action_space.contains(action), f"invalid action {action}"
@@ -361,7 +460,7 @@ class WasteSegregationEnv(gym.Env):
             )
             p_jam = jam_probability(
                 self.bin_contam_ewma[b],
-                baseline=self.cfg.jam_baseline_contamination,
+                baseline=self._active_jam_baseline,
                 kappa=self.cfg.jam_kappa,
             )
             if self._rng.random() < p_jam:
@@ -410,7 +509,7 @@ class WasteSegregationEnv(gym.Env):
             self.energy -= self.scan_energy_cost
             ambiguity = 1.0 - float(np.max(self.current_item_true))
             reduced_sigma = sensor_noise_sigma(
-                ambiguity, self.cfg.sigma_min, self.cfg.sigma_max
+                ambiguity, self._active_sigma_min, self._active_sigma_max
             ) * self.cfg.scan_noise_reduction
             self.current_item_obs = self._noisy_observation(
                 self.current_item_true, reduced_sigma
@@ -460,18 +559,40 @@ class WasteSegregationEnv(gym.Env):
     # ------------------------------------------------------------------
     # Item generation and observation
     # ------------------------------------------------------------------
-    def _spawn_item(self) -> None:
+    def _generate_item(self) -> dict:
+        """Draw one fresh conveyor item under the active demand profile.
+
+        Returns a dict of (true composition, noisy observed composition, mass)
+        rather than mutating state, so it can be used both for the current item
+        and to fill the lookahead queue.
+        """
         dominant = self._rng.choice(5, p=self._category_probs)
         alpha = np.full(5, self._other_alpha, dtype=np.float64)
         alpha[dominant] = self._dominant_alpha
         true_comp = self._rng.dirichlet(alpha)
         mass = self._rng.uniform(*self.item_mass_range)
         ambiguity = 1.0 - float(np.max(true_comp))
-        sigma = sensor_noise_sigma(ambiguity, self.cfg.sigma_min, self.cfg.sigma_max)
+        sigma = sensor_noise_sigma(ambiguity, self._active_sigma_min, self._active_sigma_max)
+        return {
+            "true": true_comp,
+            "obs": self._noisy_observation(true_comp, sigma),
+            "mass": mass,
+        }
 
-        self.current_item_true = true_comp
-        self.current_item_mass = mass
-        self.current_item_obs = self._noisy_observation(true_comp, sigma)
+    def _spawn_item(self) -> None:
+        """Advance the conveyor: promote the head of the lookahead queue to the
+        current item and append a freshly generated item to the queue tail.
+        With `queue_lookahead == 0` the queue is empty and every call simply
+        generates a new current item (original behavior)."""
+        if self.queue_lookahead > 0:
+            item = self._item_queue.pop(0)
+            self._item_queue.append(self._generate_item())
+        else:
+            item = self._generate_item()
+
+        self.current_item_true = item["true"]
+        self.current_item_obs = item["obs"]
+        self.current_item_mass = item["mass"]
 
     def _noisy_observation(self, true_comp: np.ndarray, sigma: float) -> np.ndarray:
         noise = self._rng.normal(0.0, sigma, size=true_comp.shape)
@@ -507,7 +628,7 @@ class WasteSegregationEnv(gym.Env):
             (self.max_steps - self.step_count) / max(self.max_steps, 1), 0.0, 1.0
         )
 
-        obs = np.concatenate([
+        parts = [
             fill_frac.astype(np.float32),
             contam_frac.astype(np.float32),
             jam_frac.astype(np.float32),
@@ -516,7 +637,17 @@ class WasteSegregationEnv(gym.Env):
             self.current_item_obs.astype(np.float32),
             np.array([mass_frac], dtype=np.float32),
             np.array([steps_remaining_frac], dtype=np.float32),
-        ])
+        ]
+
+        # Conveyor lookahead: append (observed composition, mass) for each of
+        # the next `queue_lookahead` items so the policy can plan ahead.
+        for item in self._item_queue:
+            parts.append(item["obs"].astype(np.float32))
+            parts.append(
+                np.array([np.clip(item["mass"] / mass_max, 0.0, 1.0)], dtype=np.float32)
+            )
+
+        obs = np.concatenate(parts)
         return np.clip(obs, 0.0, 1.0).astype(np.float32)
 
     def _get_info(self) -> dict:
@@ -531,6 +662,13 @@ class WasteSegregationEnv(gym.Env):
             "episode_stats": dict(self.episode_stats),
             "current_item_true": self.current_item_true.copy(),
             "current_item_obs": self.current_item_obs.copy(),
+            "action_mask": self.action_masks(),
+            "active_regime": {
+                "category_probs": self._category_probs.copy(),
+                "sigma_min": self._active_sigma_min,
+                "sigma_max": self._active_sigma_max,
+                "jam_baseline": self._active_jam_baseline,
+            },
         }
 
     def to_json(self) -> dict:
@@ -571,8 +709,18 @@ class WasteSegregationEnv(gym.Env):
                 },
                 "mass": float(self.current_item_mass),
             },
+            "upcoming_items": [
+                {
+                    "observed_composition": {
+                        m: float(item["obs"][j]) for j, m in enumerate(MATERIALS)
+                    },
+                    "mass": float(item["mass"]),
+                }
+                for item in self._item_queue
+            ],
             "episode_stats": {k: int(v) for k, v in self.episode_stats.items()},
             "action_names": ACTION_NAMES,
+            "action_mask": [bool(v) for v in self.action_masks()],
         }
 
     # ------------------------------------------------------------------

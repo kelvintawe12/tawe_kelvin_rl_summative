@@ -69,6 +69,37 @@ class DynamicsConfig:
 
 
 @dataclass(frozen=True)
+class RandomizationConfig:
+    """Per-episode domain-randomization ranges (opt-in).
+
+    When domain randomization is enabled, `reset()` samples a fresh operating
+    regime from these ranges so no two episodes see exactly the same demand
+    profile, sensor quality, or jam susceptibility. Training under this
+    distribution -- rather than a single fixed regime -- is what makes a policy
+    robust to the distribution shift it will meet in deployment, and it is the
+    training-time complement to the fixed held-out shifts used by
+    `results/generalization.py` at evaluation time.
+
+    All sampling is drawn from the environment's seeded RNG, so a given
+    `reset(seed=s)` still reproduces exactly the same randomized episode.
+    """
+
+    randomize_demand: bool = True
+    # Dirichlet concentration around the base demand profile: higher =>
+    # sampled profiles stay closer to the nominal one; lower => wilder shifts.
+    demand_concentration: float = 12.0
+
+    randomize_sensor: bool = True
+    # Multiplicative scale applied to both sensor-noise sigmas per episode.
+    sensor_sigma_scale_range: tuple[float, float] = (0.7, 1.5)
+
+    randomize_jam: bool = True
+    # Absolute range for the per-episode expected-contamination baseline that
+    # drives jam risk (nominal default is 0.38).
+    jam_baseline_range: tuple[float, float] = (0.30, 0.46)
+
+
+@dataclass(frozen=True)
 class RewardConfig:
     """Tunable reward-shaping magnitudes.
 

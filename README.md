@@ -269,6 +269,20 @@ service (reset/step/predict), so a browser or mobile app can render and drive
 the facility with no Python or Pygame dependency on the client. A Three.js/WebGL
 dashboard is included at `web/index.html` and served from the root URL:
 
+**One command (recommended)** — start the backend and open the 3D frontend
+together. Because the frontend uses same-origin relative API calls, a single
+uvicorn process serves both; `run.py` launches it and auto-opens the dashboard
+once the server is healthy:
+
+```bash
+uv run --extra serve python run.py
+# -> http://127.0.0.1:8000/ opens automatically (dashboard)
+# -> http://127.0.0.1:8000/docs for the interactive API explorer
+# Ctrl+C to stop. Flags: --port <n>, --no-browser, --reload
+```
+
+**Manual equivalent** (if you prefer to drive uvicorn yourself):
+
 ```bash
 uv sync --extra serve
 uv run uvicorn serve:app --reload

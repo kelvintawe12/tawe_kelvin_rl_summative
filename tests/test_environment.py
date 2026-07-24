@@ -9,7 +9,9 @@ from environment.custom_env import (
     ACTION_HOLD,
     ACTION_REJECT,
     ACTION_SCAN,
+    ACTION_SORT_METAL,
     ACTION_SORT_ORGANIC,
+    ACTION_SORT_PLASTIC,
     BINS,
     N_ACTIONS,
     WasteSegregationEnv,
@@ -153,6 +155,52 @@ class TestJammingBehavior:
         assert env.bin_jam_cooldown[0] == 2
 
 
+class TestActionMasking:
+    def test_mask_all_valid_when_no_bin_jammed(self, env):
+        env.reset(seed=3)
+        mask = env.action_masks()
+        assert mask.shape == (N_ACTIONS,)
+        assert mask.dtype == bool
+        assert mask.all()
+
+    def test_jammed_bin_masks_only_its_sort_action(self, env):
+        env.reset(seed=3)
+        env.bin_jam_cooldown[BINS.index("metal")] = 5
+        mask = env.action_masks()
+        assert not mask[ACTION_SORT_METAL]          # metal sort now invalid
+        assert mask[ACTION_SORT_ORGANIC]            # other bins unaffected
+        assert mask[ACTION_SORT_PLASTIC]
+        # Diversion / non-committal actions are always available.
+        assert mask[ACTION_REJECT]
+        assert mask[ACTION_HOLD]
+        assert mask[ACTION_SCAN]
+
+    def test_mask_is_never_all_false(self, env):
+        env.reset(seed=3)
+        env.bin_jam_cooldown[:] = 9  # every bin jammed
+        mask = env.action_masks()
+        assert mask.any(), "agent must always have at least one legal action"
+        assert mask[ACTION_REJECT] and mask[ACTION_HOLD] and mask[ACTION_SCAN]
+
+    def test_mask_present_in_info_and_json(self, env):
+        env.reset(seed=3)
+        env.bin_jam_cooldown[BINS.index("glass")] = 4
+        _, _, _, _, info = env.step(ACTION_HOLD)
+        assert "action_mask" in info
+        assert info["action_mask"].shape == (N_ACTIONS,)
+        json_state = env.to_json()
+        assert "action_mask" in json_state
+        assert len(json_state["action_mask"]) == N_ACTIONS
+        assert all(isinstance(v, bool) for v in json_state["action_mask"])
+
+    def test_mask_tracks_jam_cooldown_decay(self, env):
+        env.reset(seed=3)
+        env.bin_jam_cooldown[BINS.index("organic")] = 1
+        assert not env.action_masks()[ACTION_SORT_ORGANIC]
+        env.step(ACTION_HOLD)  # cooldown decrements to 0
+        assert env.action_masks()[ACTION_SORT_ORGANIC]
+
+
 class TestShipOutAndRewardRealization:
     def test_shipout_occurs_at_interval(self, env):
         env.reset(seed=9)
@@ -230,6 +278,112 @@ class TestGoodPolicyBeatsRandomPolicy:
             f"random actions ({random_mean:.1f})"
         )
         assert good_mean > 0, "A competent policy should achieve positive reward"
+
+
+class TestQueueLookahead:
+    def test_default_obs_dim_is_21(self, env):
+        assert env.observation_space.shape == (21,)
+        obs, _ = env.reset(seed=1)
+        assert obs.shape == (21,)
+
+    def test_lookahead_expands_observation(self):
+        e = WasteSegregationEnv(seed=1, queue_lookahead=3)
+        assert e.observation_space.shape == (21 + 6 * 3,)
+        obs, _ = e.reset(seed=1)
+        assert obs.shape == (39,)
+        assert e.observation_space.contains(obs)
+        e.close()
+
+    def test_queue_stays_full_and_obs_in_bounds_over_rollout(self):
+        e = WasteSegregationEnv(seed=2, queue_lookahead=2, max_steps=60)
+        obs, _ = e.reset(seed=2)
+        assert len(e._item_queue) == 2
+        for _ in range(60):
+            a = e.action_space.sample()
+            obs, _, term, trunc, _ = e.step(a)
+            assert e.observation_space.contains(obs)
+            if not (term or trunc):
+                assert len(e._item_queue) == 2  # buffer refilled after each spawn
+            if term or trunc:
+                break
+        e.close()
+
+    def test_current_item_was_previous_queue_head(self):
+        e = WasteSegregationEnv(seed=5, queue_lookahead=2)
+        e.reset(seed=5)
+        next_up = e._item_queue[0]["true"].copy()
+        e.step(ACTION_SORT_ORGANIC)  # consumes current item, advances conveyor
+        np.testing.assert_allclose(e.current_item_true, next_up)
+        e.close()
+
+    def test_upcoming_items_in_json(self):
+        e = WasteSegregationEnv(seed=5, queue_lookahead=2)
+        e.reset(seed=5)
+        state = e.to_json()
+        assert len(state["upcoming_items"]) == 2
+        assert "observed_composition" in state["upcoming_items"][0]
+        e.close()
+
+
+class TestDomainRandomization:
+    def test_randomization_off_uses_fixed_regime(self, env):
+        env.reset(seed=1)
+        assert env._active_sigma_min == env.cfg.sigma_min
+        assert env._active_jam_baseline == env.cfg.jam_baseline_contamination
+        np.testing.assert_allclose(env._category_probs, env._base_category_probs)
+
+    def test_randomization_changes_regime(self):
+        e = WasteSegregationEnv(seed=1, domain_randomize=True)
+        e.reset(seed=1)
+        # At least one active parameter should differ from the fixed default.
+        differs = (
+            not np.allclose(e._category_probs, e._base_category_probs)
+            or e._active_sigma_min != e.cfg.sigma_min
+            or e._active_jam_baseline != e.cfg.jam_baseline_contamination
+        )
+        assert differs
+        e.close()
+
+    def test_randomized_reset_is_reproducible_with_seed(self):
+        a = WasteSegregationEnv(seed=1, domain_randomize=True)
+        b = WasteSegregationEnv(seed=1, domain_randomize=True)
+        a.reset(seed=99)
+        b.reset(seed=99)
+        np.testing.assert_allclose(a._category_probs, b._category_probs)
+        assert a._active_sigma_min == b._active_sigma_min
+        assert a._active_jam_baseline == b._active_jam_baseline
+        a.close(); b.close()
+
+    def test_different_seeds_give_different_regimes(self):
+        a = WasteSegregationEnv(seed=1, domain_randomize=True)
+        b = WasteSegregationEnv(seed=1, domain_randomize=True)
+        a.reset(seed=1)
+        b.reset(seed=2)
+        assert not np.allclose(a._category_probs, b._category_probs)
+        a.close(); b.close()
+
+    def test_options_override_toggles_randomization(self):
+        # Constructed with randomization OFF, but reset options force it ON.
+        e = WasteSegregationEnv(seed=1, domain_randomize=False)
+        e.reset(seed=1, options={"domain_randomize": True})
+        differs = (
+            not np.allclose(e._category_probs, e._base_category_probs)
+            or e._active_sigma_min != e.cfg.sigma_min
+            or e._active_jam_baseline != e.cfg.jam_baseline_contamination
+        )
+        assert differs
+        # And back off again.
+        e.reset(seed=1, options={"domain_randomize": False})
+        np.testing.assert_allclose(e._category_probs, e._base_category_probs)
+        e.close()
+
+    def test_probs_always_valid_distribution(self):
+        e = WasteSegregationEnv(seed=3, domain_randomize=True)
+        for s in range(20):
+            e.reset(seed=s)
+            assert abs(e._category_probs.sum() - 1.0) < 1e-9
+            assert (e._category_probs >= 0).all()
+        e.close()
 
 
 def test_render_rgb_array_produces_correct_shape():
