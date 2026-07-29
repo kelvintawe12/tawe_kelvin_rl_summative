@@ -2,7 +2,7 @@
 
 **Student:** Tawe Kelvin
 **Project:** Waste Segregation Sorting Station — a custom Gymnasium environment trained with DQN, REINFORCE, A2C, and PPO
-**Repository:** https://github.com/kelvintawe12/Summative-Reinforcement-Learning
+**Repository:** https://github.com/kelvintawe12/tawe_kelvin_rl_summative
 
 ---
 
@@ -26,7 +26,10 @@ Six interacting mechanics give real sequential structure (past actions change fu
 
 *Figure 1. Pygame facility dashboard: incoming item (noisy composition), four bins with live fill/contamination and jam state, energy gauge, and running stats.*
 
-### 1.4 Action space (`Discrete(7)`)
+### 1.4 Agent
+The agent is the **sorting-station controller**: a single decision-maker that, once per timestep, observes the current item and facility state and issues exactly one routing/operating command. It represents the PLC + vision controller of a real materials-recovery-facility (MRF) sorting cell, and its capabilities are precisely the seven actions below (route to a bin, reject, hold, or run a close scan).
+
+### 1.5 Action space (`Discrete(7)` — discrete)
 | Idx | Action | Real-world meaning |
 |---|---|---|
 | 0–3 | `sort_organic/plastic/metal/glass` | Route item to the matching bin |
@@ -34,16 +37,34 @@ Six interacting mechanics give real sequential structure (past actions change fu
 | 5 | `hold` | Wait one step (item stays on belt) |
 | 6 | `scan_closely` | Spend energy for a lower-noise reading |
 
-### 1.5 Observation space (`Box(21,)`, normalized `[0,1]`)
-Bin fills (4), contamination (4), jam cooldowns (4), energy (1), consecutive holds (1), noisy item composition (5), item mass (1), steps remaining (1).
+Jammed bins are additionally exposed as an **action mask** (`env.action_masks()`), so a maskable policy never selects a physically unavailable bin.
 
-### 1.6 Reward structure
-Dominated by value realized at periodic bin **ship-outs**, discounted convexly by accumulated contamination; smaller immediate shaping on correct sorts; penalties for overflow, jamming, forced rejection from stalling, and wasting valuable material. Sanity check: a capacity-aware heuristic scores far above a random policy (`tests/test_environment.py`).
+### 1.6 Observation space (`Box(21,)`, `float32`, all components normalized to `[0,1]`)
+The agent sees a compact, normalized summary of the facility rather than the full internal state; each component maps to a concrete real-world data source.
 
-### 1.7 Start state & termination
+| Idx | Observation | Description | Source (Sensor/Camera/API/Dataset) | Encoding / Data type | Range |
+|---|---|---|---|---|---|
+| 0–3 | Bin fill fractions | How full each of the 4 bins is | Ultrasonic / load-cell level sensors per bin | `float32`, normalized | [0, 1] |
+| 4–7 | Bin contamination fractions | Impurity ratio accumulated in each bin | Inline NIR/optical purity sampler at bin intake | `float32` | [0, 1] |
+| 8–11 | Bin jam cooldown | Remaining downtime of each jammed bin | PLC motor-fault status register (API) | `float32`, normalized | [0, 1] |
+| 12 | Energy remaining | Close-scan energy budget left | Power meter / PLC counter (API) | `float32` | [0, 1] |
+| 13 | Consecutive holds | Stalling counter for the current item | Internal controller state | `float32`, normalized | [0, 1] |
+| 14–18 | Noisy item composition | Material mix of current item (organic, plastic, metal, glass, contaminant) | Hyperspectral **NIR camera** + RGB optical over belt | `float32`, ≈sums to 1 | [0, 1] |
+| 19 | Item mass | Mass of the current item | Conveyor belt **weigh scale** | `float32`, normalized | [0, 1] |
+| 20 | Steps remaining | Time left in the shift/episode | System clock / shift scheduler (API) | `float32`, normalized | [0, 1] |
+
+### 1.7 Reward structure
+Reward is dominated by value **realized at periodic bin ship-outs**, discounted convexly by accumulated contamination, with smaller immediate shaping on correct sorts and penalties for overflow, jamming, forced rejection from stalling, and wasting valuable material. Formally, at a ship-out a bin of raw accumulated value `V` and contamination fraction `c` yields
+
+  `realized = V · (1 − c)^p`  (convex contamination discount, `p = 2`),
+
+each correct sort gives immediate shaping `r_sort = 0.12 · Δvalue`, an over-cautious stall costs `−β · h²` (`β = 0.18`, `h` = consecutive holds), and simultaneous jamming of all bins terminates the episode with a `−10` shutdown penalty. Sanity check: a capacity-aware heuristic scores far above a random policy (`tests/test_environment.py`).
+
+### 1.8 Start state & termination
 - **Start:** empty bins, full energy, one freshly spawned item.
 - **Terminated:** all four bins jammed simultaneously (facility shutdown).
 - **Truncated:** `max_steps` (200) reached; a final ship-out realizes value.
+- **Robustness options:** an optional per-episode **domain randomization** mode (jitters demand profile, sensor noise, and jam baseline at `reset()`) and an optional **conveyor lookahead** (the agent sees the next 1–2 items) are available for training more transfer-robust policies.
 
 ---
 
@@ -172,8 +193,9 @@ Models are trained on the default demand profile and evaluated under shifted pro
 
 ## 5. System Implementation & Deployment (≈0.5 page)
 - **Visualization:** Pygame facility dashboard (`environment/rendering.py`) plus a browser-based Three.js/WebGL frontend (`web/index.html`) that consumes the same JSON state.
-- **Web/mobile integration:** the environment serializes to JSON (`WasteSegregationEnv.to_json()`) and is exposed over a REST API (`serve.py`, FastAPI) — reset/step/predict endpoints return the full facility state, so a browser or app can render it with no Python dependency. Run: `uv sync --extra serve && uv run uvicorn serve:app --reload` → open `/` for the 3D dashboard or `/docs` for the API explorer.
-- **Best agent demo:** `uv run main.py` auto-selects and runs the best model.
+- **Web/mobile integration:** the environment serializes to JSON (`WasteSegregationEnv.to_json()`, including the live action mask) and is exposed over a REST API (`serve.py`, FastAPI) — reset/step/predict endpoints return the full facility state, so a browser or app can render it with no Python dependency.
+- **One-command demo:** `uv run --extra serve python run.py` launches the backend and opens the 3D dashboard automatically (single same-origin process); `/docs` gives the interactive API explorer.
+- **Best agent demo:** `uv run main.py` auto-selects and runs the best model with the Pygame GUI and verbose terminal output.
 
 ---
 
@@ -194,8 +216,7 @@ uv run python -m training.ppo_training --run all
 # Analysis + generalization:
 uv run python -m results.analysis
 uv run python -m results.generalization
-uv run python main.py            # watch the best agent
-# Web dashboard:
-uv sync --extra serve
-uv run uvicorn serve:app --reload
+uv run python main.py            # watch the best agent (GUI + verbose terminal)
+# Web dashboard (backend + 3D frontend in one command):
+uv run --extra serve python run.py
 ```

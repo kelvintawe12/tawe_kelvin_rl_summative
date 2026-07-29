@@ -22,8 +22,8 @@ import nbformat as nbf
 # NOTE: the assignment asks for a repo named "<student_name>_rl_summative"
 # (i.e. tawe_kelvin_rl_summative). If/when the GitHub repo is renamed to that,
 # update REPO_URL/REPO_DIR here and re-run `python generate_notebooks.py`.
-REPO_URL = "https://github.com/kelvintawe12/Summative-Reinforcement-Learning.git"
-REPO_DIR = "Summative-Reinforcement-Learning"
+REPO_URL = "https://github.com/kelvintawe12/tawe_kelvin_rl_summative.git"
+REPO_DIR = "tawe_kelvin_rl_summative"
 
 ALGO_CONFIG = {
     "dqn": {
