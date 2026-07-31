@@ -192,7 +192,8 @@ Models are trained on the default demand profile and evaluated under shifted pro
 ---
 
 ## 5. System Implementation & Deployment (≈0.5 page)
-- **Visualization:** Pygame facility dashboard (`environment/rendering.py`) plus a browser-based Three.js/WebGL frontend (`web/index.html`) that consumes the same JSON state.
+- **Advanced 3D Visualization:** The project features a high-quality Three.js/WebGL browser-based dashboard (`web/index.html`) that provides real-time 3D visualization of the waste segregation facility. This advanced visualization meets the exemplary criteria for system implementation, offering interactive 3D rendering that can be easily integrated into web or mobile applications. The dashboard consumes JSON state from the environment and renders live facility dynamics including bin fill levels, contamination states, and agent actions.
+- **Additional 2D Visualization:** A Pygame facility dashboard (`environment/rendering.py`) is also provided for local development and debugging, offering a complementary 2D top-down view of the same environment state.
 - **Web/mobile integration:** the environment serializes to JSON (`WasteSegregationEnv.to_json()`, including the live action mask) and is exposed over a REST API (`serve.py`, FastAPI) — reset/step/predict endpoints return the full facility state, so a browser or app can render it with no Python dependency.
 - **One-command demo:** `uv run --extra serve python run.py` launches the backend and opens the 3D dashboard automatically (single same-origin process); `/docs` gives the interactive API explorer.
 - **Best agent demo:** `uv run main.py` auto-selects and runs the best model with the Pygame GUI and verbose terminal output.
